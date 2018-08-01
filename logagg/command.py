@@ -2,19 +2,24 @@ import os
 import atexit
 
 from basescript import BaseScript
-from collector import LogCollector
 from deeputil import AttrDict
 import tornado.ioloop
 import tornado.web
 from kwikapi.tornado import RequestHandler
 from kwikapi import API
 
+from collector import LogCollector
+from exceptions import InvalidArgument
+
 class LogaggCommand(BaseScript):
     DESC = 'Logagg command line tool'
 
     def collect(self):
         master = AttrDict()
-        master.host, master.port = self.args.master.split(":")
+        try:
+            master.host, master.port = self.args.master.split(":")
+        except ValueError:
+            raise InvalidArgument(self.args.master)
 
         collector = LogCollector(
             self.args.port,

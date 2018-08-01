@@ -9,6 +9,10 @@ from operator import attrgetter
 import traceback
 from six import string_types as basestring
 import six.moves.queue as queue
+import re
+from os import listdir
+from os.path import isfile, join
+from hashlib import md5
 
 import util
 from formatters import RawLog
@@ -41,6 +45,7 @@ class LogCollector(object):
     SCAN_FPATTERNS_INTERVAL = 30    # How often to scan filesystem for files matching fpatterns
     HOST = socket.gethostname()
     HEARTBEAT_RESTART_INTERVAL = 30 # Wait time if heartbeat sending stops
+    LOGAGGFS_PATTERN = re.compile("[a-fA-F\d]{32}") # md5 hash pttern
 
     LOG_STRUCTURE = {
         'id': basestring,
@@ -69,6 +74,8 @@ class LogCollector(object):
 
         # for remembering the state of files
         self.state = DiskDict(data_path)
+        # the mode on wich collector is running
+        self.mode = 'nofuse'
 
         # Log fpath to thread mapping
         self.log_reader_threads = {}
@@ -87,17 +94,6 @@ class LogCollector(object):
                 self.state['nsq_sender']['nsqtopic'],
                 self.log)
         return self.nsq_sender
-
-    def _collect(self):
-        state = AttrDict(files_tracked=list())
-        util.start_daemon_thread(self._scan_fpatterns, (state,))
-
-        state = AttrDict(last_push_ts=time.time())
-        util.start_daemon_thread(self._send_to_nsq, (state,))
-
-        state = AttrDict(heartbeat_number=0)
-        self.log.info('init_heartbeat')
-        th_heartbeat = util.start_daemon_thread(self._send_heartbeat, (state,))
 
     def _remove_redundancy(self, log):
         """Removes duplicate data from 'data' inside log dict and brings it
@@ -376,6 +372,54 @@ class LogCollector(object):
             ack_fnames.add(fname)
             freader.update_offset_file(msg['line_info'])
 
+    def _compute_fpatterns(self, f):
+        fpath = f.encode("utf-8")
+        d = self.state['logaggfs_dir']
+        dir_contents = [f for f in listdir(d) if bool(self.LOGAGGFS_PATTERN.match(f)) and isfile(join(d, f))]
+        dir_contents = set(dir_contents)
+        for c in dir_contents:
+            if md5(fpath).hexdigest() == c.split('.')[0]:
+                return md5(fpath).hexdigest() + '*' + '.log'
+
+    @keeprunning(SCAN_FPATTERNS_INTERVAL, on_error=util.log_exception)
+    def _scan_logaggfs_dir(self, state):
+        '''
+        Scans the files in a given logaggfs directory and starts a thread
+        per file for collecting it
+        '''
+        d = self.state['logaggfs_dir']
+        for f in self.state['fpaths']:
+            fpattern, formatter = self._compute_fpatterns(f['fpath']), f['formatter']
+            if fpattern == None: continue
+            fpaths = glob.glob(join(d, fpattern))
+            self.log.debug('_scan_fpatterns', fpattern=fpattern, formatter=formatter)
+            # TODO code for scanning fpatterns for the files not yet present goes here
+            # Load formatter_fn if not in list
+            fpaths = list(set(fpaths) - set(state.files_tracked))
+            for fpath in fpaths:
+                try:
+                    formatter_fn = self.formatters.get(formatter,
+                                  load_formatter_fn(formatter))
+                    self.log.info('found_formatter_fn', fn=formatter)
+                    self.formatters[formatter] = formatter_fn
+                except (SystemExit, KeyboardInterrupt): raise
+                except (ImportError, AttributeError):
+                    self.log.exception('formatter_fn_not_found', fn=formatter)
+                    sys.exit(-1)
+                # Start a thread for every file
+                self.log.info('found_log_file', log_file=fpath)
+                log_f = dict(fpath=fpath, fpattern=fpattern,
+                                formatter=formatter, formatter_fn=formatter_fn)
+                log_key = (fpath, fpattern, formatter)
+                if log_key not in self.log_reader_threads:
+                    self.log.info('starting_collect_log_lines_thread', log_key=log_key)
+                    # There is no existing thread tracking this log file. Start one
+                    log_reader_thread = util.start_daemon_thread(self._collect_log_lines, (log_f,))
+                    self.log_reader_threads[log_key] = log_reader_thread
+                state.files_tracked.append(fpath)
+        time.sleep(self.SCAN_FPATTERNS_INTERVAL)
+
+
     @keeprunning(SCAN_FPATTERNS_INTERVAL, on_error=util.log_exception)
     def _scan_fpatterns(self, state):
         '''
@@ -452,6 +496,21 @@ class LogCollector(object):
         state.heartbeat_number += 1
         time.sleep(self.HEARTBEAT_RESTART_INTERVAL)
 
+    def _collect(self):
+        if self.mode == 'nofuse':
+            state = AttrDict(files_tracked=list())
+            util.start_daemon_thread(self._scan_fpatterns, (state,))
+        else:
+            state = AttrDict(files_tracked=list())
+            util.start_daemon_thread(self._scan_logaggfs_dir, (state,))
+
+        state = AttrDict(last_push_ts=time.time())
+        util.start_daemon_thread(self._send_to_nsq, (state,))
+
+        state = AttrDict(heartbeat_number=0)
+        self.log.info('init_heartbeat')
+        th_heartbeat = util.start_daemon_thread(self._send_heartbeat, (state,))
+
     def _start(self):
         if not self.state['fpaths']:
             self.log.info('init_fpaths')
@@ -459,6 +518,9 @@ class LogCollector(object):
         if self.state['nsq_sender']:
             self.log.info('init_nsq_sender')
             self._init_nsq_sender()
+        if self.state['logaggfs_dir']:
+            self.mode = self.state['logaggfs_dir']
+
         self._collect()
 
     def add_file(self, fpath:str, formatter:str) -> list:
@@ -497,6 +559,14 @@ class LogCollector(object):
                 s.append(f)
 
         self.state['fpaths'] = s
+        self.state.flush()
+        self.log.info('exiting', fpaths=self.state['fpaths'])
+        self.log.info('restart_for_changes_to_take_effect')
+        sys.exit(0)
+
+    def set_logaggfs_dir(self, directory:str) -> dict:
+        self.state['logaggfs_dir'] = directory
+        self.mode = 'fuse'
         self.state.flush()
         self.log.info('exiting', fpaths=self.state['fpaths'])
         self.log.info('restart_for_changes_to_take_effect')
