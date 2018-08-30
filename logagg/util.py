@@ -35,11 +35,7 @@ import traceback
 
 
 def log_exception(self, __fn__):
-    try:
-        self.log.exception('error_during_run_Continuing', fn=__fn__.func_name,
-                tb=repr(traceback.format_exc()))
-    except AttributeError:
-        self.log.exception('error_during_run_Continuing', fn=__fn__.__name__,
+    self.log.exception('error_during_run_Continuing', fn=__fn__.__name__,
                 tb=repr(traceback.format_exc()))
 
 

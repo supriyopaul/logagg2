@@ -94,6 +94,9 @@ class LogCollector(object):
 
 
     def _init_fpaths(self):
+        '''
+        Files to be collected by default
+        '''
         self.state['fpaths'] = [{'fpath':'/var/log/serverstats/serverstats.log',
             'formatter':'logagg.formatters.docker_file_log_driver'}]
         self.state.flush()
@@ -101,6 +104,9 @@ class LogCollector(object):
 
 
     def _init_nsq_sender(self):
+        '''
+        Initialize nsq_sender on startup
+        '''
         self.nsq_sender = NSQSender(self.state['nsq_sender']['nsqd_http_address'],
                 self.state['nsq_sender']['nsqtopic'],
                 self.log)
@@ -108,13 +114,20 @@ class LogCollector(object):
 
 
     def _init_logaggfs_paths(self):
+        '''
+        Logaggfs directoriest and file initialization
+        '''
         self.logaggfs.dir = self.state['logaggfs_dir']
         self.logaggfs.logs_dir = os.path.abspath(os.path.join(self.logaggfs.dir, 'logs'))
         self.logaggfs.trackfiles = os.path.abspath(os.path.join(self.logaggfs.dir, 'trackfiles.txt'))
+        # If all the files are present in trackfiles
+        for f in self.state['fpaths']:
+            if not self._fpath_in_trackfiles(f['fpath']):
+                self._add_to_logaggfs_trackfile(f['fpath'])
 
     def _remove_redundancy(self, log):
-        """Removes duplicate data from 'data' inside log dict and brings it
-        out.
+        '''
+        Removes duplicate data from 'data' inside log dict and brings it out
 
         >>> lc = LogCollector('file=/path/to/log_file.log:formatter=logagg.formatters.basescript', 30)
 
@@ -122,7 +135,7 @@ class LogCollector(object):
         ...         'data' : {'a' : 1, 'b' : 2, 'type' : 'metric'}}
         >>> lc._remove_redundancy(log)
         {'data': {'a': 1, 'b': 2}, 'type': 'metric', 'id': 46846876}
-        """
+        '''
         for key in log:
             if key in log and key in log['data']:
                 log[key] = log['data'].pop(key)
@@ -131,6 +144,8 @@ class LogCollector(object):
 
     def _validate_log_format(self, log):
         '''
+        Assert if the formatted log is of the same structure as specified
+
         >>> lc = LogCollector('file=/path/to/file.log:formatter=logagg.formatters.basescript', 30)
 
         >>> incomplete_log = {'data' : {'x' : 1, 'y' : 2},
@@ -172,6 +187,8 @@ class LogCollector(object):
 
         keys_in_log = set(log)
         keys_in_log_structure = set(self.LOG_STRUCTURE)
+
+        # Check keys
         try:
             assert (keys_in_log == keys_in_log_structure)
         except AssertionError as e:
@@ -182,6 +199,7 @@ class LogCollector(object):
                                 type='metric')
             return 'failed'
 
+        # Check datatype of values
         for key in log:
             try:
                 assert isinstance(log[key], self.LOG_STRUCTURE[key])
@@ -198,20 +216,25 @@ class LogCollector(object):
 
 
     def _full_from_frags(self, frags):
+        '''
+        Join partial lines to full lines
+        '''
         full_line = '\n'.join([l for l, _ in frags])
         line_info = frags[-1][-1]
         return full_line, line_info
 
 
     def _iter_logs(self, freader, fmtfn):
-        # FIXME: does not handle partial lines
-        # at the start of a file properly
+        '''
+        Iterate on log lines and identify full lines from full ones
+        '''
+        # FIXME: does not handle partial lines at the start of a file properly
 
         frags = []
 
         for line_info in freader:
-            line = line_info['line'][:-1] # remove new line char at the end
-
+            # Remove new line char at the end
+            line = line_info['line'][:-1]
             if not fmtfn.ispartial(line) and frags:
                 yield self._full_from_frags(frags)
                 frags = []
@@ -262,8 +285,40 @@ class LogCollector(object):
           )
 
 
+    def _delete_file(self, fpath):
+        '''
+        Delete log file from logaggfs 'logs' directory along with its offset file
+        '''
+        os.remove(fpath)
+        os.remove(fpath+'.offset')
+
+
+    @keeprunning(LOG_FILE_POLL_INTERVAL, on_error=util.log_exception)
+    def _collect_log_files(self, log_files):
+        '''
+        Collect from log files in logaggfs 'logs' one by one
+        '''
+
+        L = log_files
+        # Sorted list of all the files for one pattern
+        fpaths = glob.glob(join(self.logaggfs.logs_dir, L['fpattern']))
+        fpaths = sorted(fpaths)
+
+        for f in fpaths:
+            log_files.update({'fpath': f})
+            # If last file in the list keep polling until next file arrives
+            self._collect_log_lines(log_files)
+            if not f == fpaths[-1]:
+                self.log.info('deleting_file', f=f)
+                self._delete_file(f)
+        time.sleep(1)
+
+
     @keeprunning(LOG_FILE_POLL_INTERVAL, on_error=util.log_exception)
     def _collect_log_lines(self, log_file):
+        '''
+        Collects logs from logfiles, formats and puts in queue
+        '''
         L = log_file
         fpath = L['fpath']
         fmtfn = L['formatter_fn']
@@ -275,10 +330,12 @@ class LogCollector(object):
 
             try:
                 _log = fmtfn(line)
-
+                # Identify logs inside a log
+                # Like process logs inside docker logs
                 if isinstance(_log, RawLog):
                     formatter, raw_log = _log['formatter'], _log['raw']
                     log.update(_log)
+                    # Give them to actual formatters
                     _log = load_formatter_fn(formatter)(raw_log)
 
                 log.update(_log)
@@ -302,7 +359,13 @@ class LogCollector(object):
             t = self.PYGTAIL_ACK_WAIT_TIME
             self.log.debug('waiting_for_pygtail_to_fully_ack', wait_time=t)
             time.sleep(t)
-        time.sleep(self.LOG_FILE_POLL_INTERVAL)
+
+        if self.mode == 'fuse':
+            # Terminate to check new files have arrived in directory or not?
+            raise keeprunning.terminate
+        else:
+            # Do not terminate on 'nofuse' mode
+            time.sleep(self.LOG_FILE_POLL_INTERVAL)
 
 
     def _get_msgs_from_queue(self, msgs, timeout):
@@ -398,7 +461,7 @@ class LogCollector(object):
             freader.update_offset_file(msg['line_info'])
 
 
-    def _compute_fpatterns(self, f):
+    def _compute_md5_fpatterns(self, f):
 
         # For every file in logaggfs logs directory compute 'md5*.log' pattern
         fpath = f.encode("utf-8")
@@ -440,17 +503,12 @@ class LogCollector(object):
         for f in self.state['fpaths']:
 
             if self.mode == 'fuse':
-                fpattern, formatter = self._compute_fpatterns(f['fpath']), f['formatter']
+
+                # Compute 'md5(filename)*.log' fpattern for fpath
+                fpattern, formatter = self._compute_md5_fpatterns(f['fpath']), f['formatter']
+                # When no md5 pattern filenames are found for the fpath in logaggfs logs directory
                 if fpattern == None: continue
-                fpaths = glob.glob(join(self.logaggfs.logs_dir, fpattern))
-            else:
-                fpattern, formatter = f['fpath'], f['formatter']
-                fpaths = glob.glob(fpattern)
-                fpaths = list(set(fpaths) - set(state.files_tracked))
-            self.log.debug('_scan_fpatterns', fpattern=fpattern, formatter=formatter, fpaths=fpaths)
-
-            for fpath in fpaths:
-
+                self.log.debug('_scan_fpatterns', fpattern=fpattern, formatter=formatter)
                 try:
                     formatter_fn = self.formatters.get(formatter,
                                   load_formatter_fn(formatter))
@@ -460,16 +518,47 @@ class LogCollector(object):
                 except (ImportError, AttributeError):
                     self.log.exception('formatter_fn_not_found', fn=formatter)
                     sys.exit(-1)
-                # Start a thread for every file
-                log_f = dict(fpath=fpath, fpattern=fpattern,
+                # Start a thread for every filepattern
+                log_f = dict(fpattern=fpattern,
                                 formatter=formatter, formatter_fn=formatter_fn)
-                log_key = (fpath, fpattern, formatter)
+                log_key = (f['fpath'], fpattern, formatter)
                 if log_key not in self.log_reader_threads:
-                    self.log.info('starting_collect_log_lines_thread', log_key=log_key)
-                    # There is no existing thread tracking this log file. Start one
-                    log_reader_thread = util.start_daemon_thread(self._collect_log_lines, (log_f,))
+
+                    self.log.info('starting_collect_log_files_thread', log_key=log_key)
+                    # There is no existing thread tracking this log file, start one.
+                    log_reader_thread = util.start_daemon_thread(self._collect_log_files, (log_f,))
                     self.log_reader_threads[log_key] = log_reader_thread
-                state.files_tracked.append(fpath)
+
+
+            else:
+
+                fpattern, formatter = f['fpath'], f['formatter']
+                fpaths = glob.glob(fpattern)
+                fpaths = list(set(fpaths) - set(state.files_tracked))
+                self.log.debug('_scan_fpatterns', fpattern=fpattern, formatter=formatter)
+
+                for fpath in fpaths:
+
+                    try:
+                        formatter_fn = self.formatters.get(formatter,
+                                      load_formatter_fn(formatter))
+                        self.log.debug('found_formatter_fn', fn=formatter)
+                        self.formatters[formatter] = formatter_fn
+                    except (SystemExit, KeyboardInterrupt): raise
+                    except (ImportError, AttributeError):
+                        self.log.exception('formatter_fn_not_found', fn=formatter)
+                        sys.exit(-1)
+                    # Start a thread for every file
+                    log_f = dict(fpath=fpath, fpattern=fpattern,
+                                    formatter=formatter, formatter_fn=formatter_fn)
+                    log_key = (fpath, fpattern, formatter)
+                    if log_key not in self.log_reader_threads:
+
+                        self.log.info('starting_collect_log_lines_thread', log_key=log_key)
+                        # There is no existing thread tracking this log file. Start one
+                        log_reader_thread = util.start_daemon_thread(self._collect_log_lines, (log_f,))
+                        self.log_reader_threads[log_key] = log_reader_thread
+                    state.files_tracked.append(fpath)
         time.sleep(self.SCAN_FPATTERNS_INTERVAL)
 
 
@@ -524,6 +613,14 @@ class LogCollector(object):
 
         self._collect()
 
+    def _fpath_in_trackfiles(self, fpath):
+
+        # List of files in trackfiles.txt
+        tf = open(self.logaggfs.trackfiles, 'r').readlines()
+
+        for path in tf:
+            if path[:-1] in tf: return True
+        return False
 
     def _add_to_logaggfs_trackfile(self, fpath):
 
@@ -558,7 +655,7 @@ class LogCollector(object):
         f = {"fpath":fpath, "formatter":formatter}
 
         # Add new file to logaggfs trackfiles.txt
-        if self.mode == 'fuse':
+        if self.mode == 'fuse' and not self._fpath_in_trackfiles(fpath):
             self._add_to_logaggfs_trackfile(f['fpath'])
 
         # Add new file to state
@@ -602,8 +699,9 @@ class LogCollector(object):
     def remove_file(self, fpath:str) -> dict:
         #FIXME: stops the program after removing
 
+        if self.mode == 'fuse':
         # Remove fpath from logaggfs trackfile.txt
-        self._remove_from_logaggfs_trackfile(fpath)
+            self._remove_from_logaggfs_trackfile(fpath)
 
         # Remove fpath from state
         s = list()
