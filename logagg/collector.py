@@ -666,13 +666,17 @@ class CollectorService():
 
 
     def get_files(self) -> list:
-
-        # List of files to be tracked by collector
+        '''
+        List of file patterns to be tracked by collector
+        '''
         return self.collector.state['fpaths']
 
 
+
     def get_nsq(self) -> dict:
-        return self.collector.state['nsq_sender']
+        return dict(nsqd_http_address = self.collector.nsq_sender.nsqd_http_address,
+                topic_name = self.collector.nsq_sender.topic_name)
+
 
 
     def get_active_log_collectors(self) -> list:
