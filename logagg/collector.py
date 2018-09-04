@@ -1,6 +1,5 @@
 import sys
 import time
-import ujson as json
 import glob
 import uuid
 import socket
@@ -13,15 +12,21 @@ import re
 import os
 from os.path import isfile, join
 from hashlib import md5
-
 import shutil
-from formatters import RawLog
+import tempfile
+
+import ujson as json
 from diskdict import DiskDict
 from deeputil import AttrDict
 from deeputil import keeprunning
 from pygtail import Pygtail
+import tornado.ioloop
+import tornado.web
+from kwikapi.tornado import RequestHandler
+from kwikapi import API
 
 from nsqsender import NSQSender
+from formatters import RawLog
 import util
 
 def load_formatter_fn(formatter):
@@ -35,20 +40,23 @@ def load_formatter_fn(formatter):
     return obj
 
 
-class LogCollector(object):
+class LogCollector():
     DESC = 'Collects the log information and sends to NSQTopic'
 
-    QUEUE_MAX_SIZE = 2000                               # Maximum number of messages in in-mem queue
-    MAX_NBYTES_TO_SEND = 4.5 * (1024**2)                # Number of bytes from in-mem queue minimally required to push
-    MIN_NBYTES_TO_SEND = 512 * 1024                     # Minimum number of bytes to send to nsq in mpub
-    MAX_SECONDS_TO_PUSH = 1                             # Wait till this much time elapses before pushing
-    LOG_FILE_POLL_INTERVAL = 0.25                       # Wait time to pull log file for new lines added
-    QUEUE_READ_TIMEOUT = 1                              # Wait time when doing blocking read on the in-mem q
-    PYGTAIL_ACK_WAIT_TIME = 0.05                        # TODO: Document this
-    SCAN_FPATTERNS_INTERVAL = 30                        # How often to scan filesystem for files matching fpatterns
+    QUEUE_MAX_SIZE = 2000 # Maximum number of messages in in-mem queue
+    MAX_NBYTES_TO_SEND = 4.5 * (1024**2) # Number of bytes from in-mem queue minimally required to push
+    MIN_NBYTES_TO_SEND = 512 * 1024 # Minimum number of bytes to send to nsq in mpub
+    MAX_SECONDS_TO_PUSH = 1 # Wait till this much time elapses before pushing
+    LOG_FILE_POLL_INTERVAL = 0.25 # Wait time to pull log file for new lines added
+    QUEUE_READ_TIMEOUT = 1 # Wait time when doing blocking read on the in-mem q
+    PYGTAIL_ACK_WAIT_TIME = 0.05 # TODO: Document this
+    SCAN_FPATTERNS_INTERVAL = 30 # How often to scan filesystem for files matching fpatterns
     HOST = socket.gethostname()
-    HEARTBEAT_RESTART_INTERVAL = 30                     # Wait time if heartbeat sending stops
-    LOGAGGFS_FPATH_PATTERN = re.compile("[a-fA-F\d]{32}") # md5 hash pattern
+    HEARTBEAT_RESTART_INTERVAL = 30 # Wait time if heartbeat sending stops
+    LOGAGGFS_FPATH_PATTERN = re.compile("[a-fA-F\d]{32}") # MD5 hash pattern
+    SERVERSTATS_FPATH = '/var/log/serverstats/serverstats.log' # Path to serverstats log file
+    DOCKER_FORMATTER = 'logagg.formatters.docker_file_log_driver' # Formatter name for docker_file_log_driver
+    BASESCRIPT_FORMATTER = 'logagg.formatters.basescript' #FIXME: remove later
 
     LOG_STRUCTURE = {
         'id': basestring,
@@ -66,25 +74,25 @@ class LogCollector(object):
     }
 
 
-    def __init__(self, port, auth_key, auth_secret, data_path, master, log):
+    def __init__(self, data_dir, logaggfs_dir, master, log):
 
-        self.port = port
-        self.auth_key = auth_key
-        self.auth_secret = auth_secret
+        # For storing state
+        data_path = os.path.abspath(os.path.join(data_dir, 'logagg-data'))
         self.data_path = util.ensure_dir(data_path)
+
+        # For log file that have been read
+        archive_path = os.path.abspath(os.path.join(data_dir, 'logagg-archive'))
+        self.archive_dir = util.ensure_dir(archive_path)
+
         self.master = master
 
         self.log = log
 
         # For remembering the state of files
-        self.state = DiskDict(data_path)
-        # the mode on wich collector is running
-        self.mode = self.state['mode'] or 'nofuse'
+        self.state = DiskDict(self.data_path)
 
-        self.logaggfs = AttrDict()
         # Initialize logaggfs paths
-        if self.mode == 'fuse':
-            self._init_logaggfs_paths()
+        self.logaggfs = self._init_logaggfs_paths(logaggfs_dir)
 
         # Log fpath to thread mapping
         self.log_reader_threads = {}
@@ -92,13 +100,25 @@ class LogCollector(object):
         self.formatters = {}
         self.queue = queue.Queue(maxsize=self.QUEUE_MAX_SIZE)
 
+        # Add initial files i.e. serverstats to state
+        if not self.state['fpaths']:
+            self.log.info('init_fpaths')
+            self._init_fpaths()
+
+        # Create nsq_sender
+        self.log.info('init_nsq_sender')
+        self._init_nsq_sender()
+        #self.nsq_sender = util.DUMMY
+
+        self._ensure_trackfiles_sync()
+
 
     def _init_fpaths(self):
         '''
         Files to be collected by default
         '''
-        self.state['fpaths'] = [{'fpath':'/var/log/serverstats/serverstats.log',
-            'formatter':'logagg.formatters.docker_file_log_driver'}]
+        self.state['fpaths'] = [{'fpath':self.SERVERSTATS_FPATH,
+            'formatter':self.BASESCRIPT_FORMATTER}]
         self.state.flush()
         return self.state['fpaths']
 
@@ -107,23 +127,31 @@ class LogCollector(object):
         '''
         Initialize nsq_sender on startup
         '''
-        self.nsq_sender = NSQSender(self.state['nsq_sender']['nsqd_http_address'],
-                self.state['nsq_sender']['nsqtopic'],
-                self.log)
+        #FIXME: Take this from master
+        self.nsq_sender = NSQSender('localhost:4151', 'logagg', self.log)
         return self.nsq_sender
 
 
-    def _init_logaggfs_paths(self):
+    def _init_logaggfs_paths(self, logaggfs_dir):
         '''
-        Logaggfs directoriest and file initialization
+        Logaggfs directories and file initialization
         '''
-        self.logaggfs.dir = self.state['logaggfs_dir']
-        self.logaggfs.logs_dir = os.path.abspath(os.path.join(self.logaggfs.dir, 'logs'))
-        self.logaggfs.trackfiles = os.path.abspath(os.path.join(self.logaggfs.dir, 'trackfiles.txt'))
+        logaggfs = AttrDict()
+        logaggfs.logcache = logaggfs_dir
+        logaggfs.logs_dir = os.path.abspath(os.path.join(logaggfs.logcache, 'logs'))
+        logaggfs.trackfiles = os.path.abspath(os.path.join(logaggfs.logcache, 'trackfiles.txt'))
+        return logaggfs
+
+
+    def _ensure_trackfiles_sync(self):
+        '''
+        Make sure fpaths in logagg state-file are present in
+        logaggfs trackfiles on start up
+        '''
         # If all the files are present in trackfiles
         for f in self.state['fpaths']:
             if not self._fpath_in_trackfiles(f['fpath']):
-                self._add_to_logaggfs_trackfile(f['fpath'])
+                self.add_to_logaggfs_trackfile(f['fpath'])
 
     def _remove_redundancy(self, log):
         '''
@@ -285,11 +313,11 @@ class LogCollector(object):
           )
 
 
-    def _delete_file(self, fpath):
+    def _archive_file(self, fpath):
         '''
-        Delete log file from logaggfs 'logs' directory along with its offset file
+        Move log file from logaggfs 'logs' directory
         '''
-        os.remove(fpath)
+        shutil.move(fpath, self.archive_dir+'/'+fpath.split('/')[-1])
         os.remove(fpath+'.offset')
 
 
@@ -309,12 +337,11 @@ class LogCollector(object):
             # If last file in the list keep polling until next file arrives
             self._collect_log_lines(log_files)
             if not f == fpaths[-1]:
-                self.log.info('deleting_file', f=f)
-                self._delete_file(f)
+                self.log.debug('archiving_file', f=f)
+                self._archive_file(f)
         time.sleep(1)
 
 
-    @keeprunning(LOG_FILE_POLL_INTERVAL, on_error=util.log_exception)
     def _collect_log_lines(self, log_file):
         '''
         Collects logs from logfiles, formats and puts in queue
@@ -359,13 +386,6 @@ class LogCollector(object):
             t = self.PYGTAIL_ACK_WAIT_TIME
             self.log.debug('waiting_for_pygtail_to_fully_ack', wait_time=t)
             time.sleep(t)
-
-        if self.mode == 'fuse':
-            # Terminate to check new files have arrived in directory or not?
-            raise keeprunning.terminate
-        else:
-            # Do not terminate on 'nofuse' mode
-            time.sleep(self.LOG_FILE_POLL_INTERVAL)
 
 
     def _get_msgs_from_queue(self, msgs, timeout):
@@ -462,8 +482,9 @@ class LogCollector(object):
 
 
     def _compute_md5_fpatterns(self, f):
-
-        # For every file in logaggfs logs directory compute 'md5*.log' pattern
+        '''
+        For a filepath in logaggfs logs directory compute 'md5*.log' pattern
+        '''
         fpath = f.encode("utf-8")
         d = self.logaggfs.logs_dir
         dir_contents = [f for f in os.listdir(d) if bool(self.LOGAGGFS_FPATH_PATTERN.match(f)) and isfile(join(d, f))]
@@ -502,10 +523,11 @@ class LogCollector(object):
         '''
         for f in self.state['fpaths']:
 
-            if self.mode == 'fuse':
+            # For supporting file patterns rather than file paths
+            for fpath in glob.glob(f['fpath']):
 
                 # Compute 'md5(filename)*.log' fpattern for fpath
-                fpattern, formatter = self._compute_md5_fpatterns(f['fpath']), f['formatter']
+                fpattern, formatter = self._compute_md5_fpatterns(fpath), f['formatter']
                 # When no md5 pattern filenames are found for the fpath in logaggfs logs directory
                 if fpattern == None: continue
                 self.log.debug('_scan_fpatterns', fpattern=fpattern, formatter=formatter)
@@ -529,36 +551,6 @@ class LogCollector(object):
                     log_reader_thread = util.start_daemon_thread(self._collect_log_files, (log_f,))
                     self.log_reader_threads[log_key] = log_reader_thread
 
-
-            else:
-
-                fpattern, formatter = f['fpath'], f['formatter']
-                fpaths = glob.glob(fpattern)
-                fpaths = list(set(fpaths) - set(state.files_tracked))
-                self.log.debug('_scan_fpatterns', fpattern=fpattern, formatter=formatter)
-
-                for fpath in fpaths:
-
-                    try:
-                        formatter_fn = self.formatters.get(formatter,
-                                      load_formatter_fn(formatter))
-                        self.log.debug('found_formatter_fn', fn=formatter)
-                        self.formatters[formatter] = formatter_fn
-                    except (SystemExit, KeyboardInterrupt): raise
-                    except (ImportError, AttributeError):
-                        self.log.exception('formatter_fn_not_found', fn=formatter)
-                        sys.exit(-1)
-                    # Start a thread for every file
-                    log_f = dict(fpath=fpath, fpattern=fpattern,
-                                    formatter=formatter, formatter_fn=formatter_fn)
-                    log_key = (fpath, fpattern, formatter)
-                    if log_key not in self.log_reader_threads:
-
-                        self.log.info('starting_collect_log_lines_thread', log_key=log_key)
-                        # There is no existing thread tracking this log file. Start one
-                        log_reader_thread = util.start_daemon_thread(self._collect_log_lines, (log_f,))
-                        self.log_reader_threads[log_key] = log_reader_thread
-                    state.files_tracked.append(fpath)
         time.sleep(self.SCAN_FPATTERNS_INTERVAL)
 
 
@@ -583,7 +575,7 @@ class LogCollector(object):
         time.sleep(self.HEARTBEAT_RESTART_INTERVAL)
 
 
-    def _collect(self):
+    def collect(self):
 
         # start tracking files and put formatted log lines into queue
         state = AttrDict(files_tracked=list())
@@ -599,55 +591,62 @@ class LogCollector(object):
         th_heartbeat = util.start_daemon_thread(self._send_heartbeat, (state,))
 
 
-    def _start(self):
-
-        # Add initial files i.e. serverstats to state
-        if not self.state['fpaths']:
-            self.log.info('init_fpaths')
-            self._init_fpaths()
-
-        # Create nsq_sender
-        if self.state['nsq_sender']:
-            self.log.info('init_nsq_sender')
-            self._init_nsq_sender()
-
-        self._collect()
-
     def _fpath_in_trackfiles(self, fpath):
+        '''
+        Check the presence of fpath is in logaggfs trackfiles.txt
+        '''
 
         # List of files in trackfiles.txt
         tf = open(self.logaggfs.trackfiles, 'r').readlines()
 
         for path in tf:
-            if path[:-1] in tf: return True
+            if path[:-1] == fpath: return True
         return False
 
-    def _add_to_logaggfs_trackfile(self, fpath):
-
-        # Given a fpath add it to logaggfs trackfiles.txt via moving
-        tmpfile = open('/tmp/trackfiles.txt', 'w+')
+    def add_to_logaggfs_trackfile(self, fpath):
+        '''
+        Given a fpath add it to logaggfs trackfiles.txt via moving
+        '''
+        fd, tmpfile = tempfile.mkstemp()
 
         with open(self.logaggfs.trackfiles, 'r') as f:
-            tmpfile.write(f.read() + fpath + '\n')
-        tmpfile.close()
+            old = f.read()
+            new = fpath
+            # Write previous files and add the new file
+            if not self._fpath_in_trackfiles(new):
+                with open(tmpfile, 'w') as t: t.write((old+new+'\n'))
 
-        shutil.move('/tmp/trackfiles.txt', self.logaggfs.trackfiles)
+        shutil.move(tmpfile, self.logaggfs.trackfiles)
 
 
-    def _remove_from_logaggfs_trackfile(self, fpath):
+    def remove_from_logaggfs_trackfile(self, fpath):
 
         # Given a fpath remove it from logaggfs trackfiles.txt via moving
-        tmpfile = open('/tmp/trackfiles.txt', 'w+')
+        fd, tmpfile = tempfile.mkstemp()
 
         with open(self.logaggfs.trackfiles, 'r') as f:
             paths = [line[:-1] for line in f.readlines()]
 
         for p in paths:
-            if p == fpath: pass
-            else: tmpfile.write(p + '\n')
+            if p == fpath:
+                pass
+            else:
+                with open(tmpfile, 'w+')as t:
+                    t.write((p+'\n'))
 
-        shutil.move('/tmp/trackfiles.txt', self.logaggfs.trackfiles)
-        tmpfile.close()
+        shutil.move(tmpfile, self.logaggfs.trackfiles)
+
+
+class CollectorService():
+    def __init__(self, collector, log):
+        self.collector = collector
+        self.log = log
+
+
+    def start(self) -> dict:
+        self.collector.collect()
+
+        return dict(self.collector.state)
 
 
     def add_file(self, fpath:str, formatter:str) -> list:
@@ -655,43 +654,31 @@ class LogCollector(object):
         f = {"fpath":fpath, "formatter":formatter}
 
         # Add new file to logaggfs trackfiles.txt
-        if self.mode == 'fuse' and not self._fpath_in_trackfiles(fpath):
-            self._add_to_logaggfs_trackfile(f['fpath'])
+        self.collector.add_to_logaggfs_trackfile(f['fpath'])
 
         # Add new file to state
-        s = self.state['fpaths']
+        s = self.collector.state['fpaths']
         s.append(f)
-        self.state['fpaths'] = self.fpaths = s
-        self.state.flush()
+        self.collector.state['fpaths'] = self.collector.fpaths = s
+        self.collector.state.flush()
 
-        return self.state['fpaths']
+        return self.collector.state['fpaths']
 
 
     def get_files(self) -> list:
 
         # List of files to be tracked by collector
-        return self.state['fpaths']
-
-
-    def set_nsq(self, nsqd_http_address:str, topic:str) -> dict:
-
-        # Store nsq details in state in disk-dict
-        self.state['nsq_sender'] = {'nsqd_http_address': nsqd_http_address,
-                'nsqtopic': topic}
-        self.state.flush()
-        self.log.info('exiting', fpaths=self.state['nsq_sender'])
-        self.log.info('restart_for_changes_to_take_effect')
-        sys.exit(0)
+        return self.collector.state['fpaths']
 
 
     def get_nsq(self) -> dict:
-        return self.state['nsq_sender']
+        return self.collector.state['nsq_sender']
 
 
     def get_active_log_collectors(self) -> list:
 
         # return the files on which active threads are running to collect logs
-        collectors = self.log_reader_threads
+        collectors = self.collector.log_reader_threads
         c = [t[0] for t in collectors if collectors[t].isAlive()]
         return c
 
@@ -699,40 +686,18 @@ class LogCollector(object):
     def remove_file(self, fpath:str) -> dict:
         #FIXME: stops the program after removing
 
-        if self.mode == 'fuse':
         # Remove fpath from logaggfs trackfile.txt
-            self._remove_from_logaggfs_trackfile(fpath)
+        self.collector.remove_from_logaggfs_trackfile(fpath)
 
         # Remove fpath from state
         s = list()
-        for f in self.state['fpaths']:
+        for f in self.collector.state['fpaths']:
             if f['fpath'] == fpath: pass
             else: s.append(f)
 
-        self.state['fpaths'] = s
-        self.state.flush()
-        self.log.info('exiting', fpaths=self.state['fpaths'])
+        self.collector.state['fpaths'] = s
+        self.collector.state.flush()
+        self.log.info('exiting', fpaths=self.collector.state['fpaths'])
         self.log.info('restart_for_changes_to_take_effect')
         sys.exit(0)
-
-
-    def set_logaggfs_dir(self, directory:str) -> dict:
-        #FIXME: stops the program after updating
-
-        # Store logaggfs directory to state file
-        self.state['logaggfs_dir'] = directory
-
-        # Change mode to fuse
-        self.state['mode'] = 'fuse'
-        self.state.flush()
-        self.log.info('exiting', mode=self.state['mode'])
-        self.log.info('restart_for_changes_to_take_effect')
-        sys.exit(0)
-
-
-    def get_mode(self) -> dict:
-        if self.state['mode'] == 'fuse':
-            return dict(mode=self.state['mode'], logaggfs_dir=self.state['logaggfs_dir'])
-        else:
-            return dict(mode=self.mode)
 

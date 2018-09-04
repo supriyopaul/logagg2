@@ -1,5 +1,4 @@
 import os
-import atexit
 
 from basescript import BaseScript
 from deeputil import AttrDict
@@ -8,7 +7,7 @@ import tornado.web
 from kwikapi.tornado import RequestHandler
 from kwikapi import API
 
-from collector import LogCollector
+from collector import LogCollector, CollectorService
 from exceptions import InvalidArgument
 
 class LogaggCommand(BaseScript):
@@ -17,21 +16,29 @@ class LogaggCommand(BaseScript):
     def collect(self):
         master = AttrDict()
         try:
-            master.host, master.port = self.args.master.split(":")
+            m = self.args.master.split(':')
+            # So that order of keys is not a factor
+            for a in m:
+                a = a.split('=')
+                if a[0] == 'host': master.host = a[-1]
+                elif a[0] == 'port': master.port = a[-1]
+                elif a[0] == 'key': master.key = a[-1]
+                elif a[0] == 'secret': master.secret = a[-1]
+                else: raise ValueError
+
         except ValueError:
             raise InvalidArgument(self.args.master)
 
+        # Create collector object
         collector = LogCollector(
-            self.args.port,
-            self.args.auth_key,
-            self.args.auth_secret,
-            self.args.data_path,
+            self.args.data_dir,
+            self.args.logaggfs_dir,
             master,
             self.log)
-        collector._start()
 
+        collector_api = CollectorService(collector, self.log)
         api = API()
-        api.register(collector, 'v1')
+        api.register(collector_api, 'v1')
 
         app = tornado.web.Application([
             (r'^/logagg/.*', RequestHandler, dict(api=api)),
@@ -50,17 +57,14 @@ class LogaggCommand(BaseScript):
                 '--port', '-p', default=1099,
                 help='port to run logagg collector service on, default: %(default)s')
         collect_cmd.add_argument(
-                '--auth-key', '-k', required=True,
-                help='Provide auth-key')
+                '--master', '-m', required=True,
+                help= 'Master service details, format: <host=localhost:port=1100:key=xyz:secret=xxxx>')
         collect_cmd.add_argument(
-                '--auth-secret', '-s', required=True,
-                help='Provide auth-secret')
-        collect_cmd.add_argument(
-                '--data-path', '-d', default=os.getcwd()+'/logagg-data',
+                '--data-dir', '-d', default=os.getcwd()+'/logagg-data',
                 help= 'Data path for logagg, default: %(default)s')
         collect_cmd.add_argument(
-                '--master', '-m', required=True,
-                help= 'Master service to take commands from, <host:port>')
+                '--logaggfs-dir', '-l', default='/logcache',
+                help= 'LogaggFS directory, default: %(default)s')
 
 def main():
     LogaggCommand().start()

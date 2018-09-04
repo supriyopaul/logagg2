@@ -127,10 +127,7 @@ from os import path, makedirs
 
 def ensure_dir(dir_path):
     #TODO: test case
-    directory = path.dirname(dir_path)
-    if not path.exists(directory):
-        makedirs(directory)
+    if not path.exists(dir_path):
+        makedirs(dir_path)
     return dir_path
-
-
 
